@@ -255,6 +255,10 @@ void JogCalcs::run(const ros::TimerEvent& timer_event)
   // If we should halt
   if (!have_nonzero_command_)
   {
+    // Keep the joint position filters up-to-date with current joints
+    for (std::size_t i = 0; i < num_joints_; ++i)
+      position_filters_[i].reset(original_joint_state_.position[i]);
+
     suddenHalt(*joint_trajectory);
     have_nonzero_twist_stamped_ = false;
     have_nonzero_joint_jog_ = false;
@@ -436,6 +440,7 @@ bool JogCalcs::jointJogCalcs(const control_msgs::JointJog& cmd, trajectory_msgs:
 
   // Apply user-defined scaling
   delta_theta_ = scaleJointCommand(cmd);
+  delta_theta_ *= -1;
 
   enforceSRDFAccelVelLimits(delta_theta_);
 
