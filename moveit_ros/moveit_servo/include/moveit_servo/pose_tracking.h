@@ -108,7 +108,7 @@ public:
    * @return Pose status tracking code of the move
    */
   int8_t moveToPose(const Eigen::Vector3d& positional_tolerance, const double angular_tolerance,
-                    const geometry_msgs::PoseStampedConstPtr& target_pose = nullptr);
+                    const geometry_msgs::PoseStampedPtr& target_pose = nullptr);
 
   /**
    * Asynchronously starts Servoing towards the goal pose
@@ -118,7 +118,7 @@ public:
    * @param angular_tolerance if the rotational tolerance for when the motion is complete
    */
   void moveToPoseAsync(const Eigen::Vector3d& positional_tolerance, const double angular_tolerance,
-                       const geometry_msgs::PoseStampedConstPtr& target_pose = nullptr);
+                       const geometry_msgs::PoseStampedPtr& target_pose = nullptr);
 
   /** \brief A method for a different thread to stop motion and return early from control loop */
   void stopMotion()
@@ -144,7 +144,6 @@ public:
    * @return true if a valid transform was available
    */
   bool getEEFrameTransform(geometry_msgs::TransformStamped& transform);
-
 
   // moveit_servo::Servo instance. Public so we can access member functions like setPaused()
   std::unique_ptr<moveit_servo::Servo> servo_;
@@ -182,7 +181,7 @@ private:
    * @return True if the pose is sufficiently close
    */
   bool satisfiesPoseTolerance(const geometry_msgs::PoseStamped& target_pose, const Eigen::Isometry3d& current_ee_tf,
-                              const Eigen::Vector3d& positional_tolerance, const double angular_tolerance);
+                              const Eigen::Vector3d& positional_tolerance, const double angular_tolerance) const;
 
   /** \brief Subscribe to the target pose on this topic */
   void targetPoseCallback(const geometry_msgs::PoseStampedConstPtr& msg);
@@ -197,7 +196,7 @@ private:
   void stopTimer();  // TODO(adamp): change name away from "timer" to more specificity?
 
   /** \brief Converts the target pose to the correct frame and stores it */
-  bool processIncomingTargetPose(const geometry_msgs::PoseStampedConstPtr& msg);
+  bool processIncomingTargetPose(const geometry_msgs::PoseStamped& msg);
 
   /**
    * Use PID controllers to calculate a full spatial velocity toward a pose

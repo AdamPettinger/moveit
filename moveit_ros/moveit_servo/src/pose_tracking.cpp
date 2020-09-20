@@ -125,12 +125,12 @@ void PoseTracking::timerCallback(const ros::TimerEvent& timer_event)
 }
 
 void PoseTracking::moveToPoseAsync(const Eigen::Vector3d& positional_tolerance, const double angular_tolerance,
-                                   const geometry_msgs::PoseStampedConstPtr& target_pose)
+                                   const geometry_msgs::PoseStampedPtr& target_pose)
 {
   // Set the passed pose as the target pose if it's not null
   if (target_pose)
   {
-    processIncomingTargetPose(target_pose);
+    processIncomingTargetPose(*target_pose);
   }
 
   // Set the tolerances for the move
@@ -145,7 +145,7 @@ void PoseTracking::moveToPoseAsync(const Eigen::Vector3d& positional_tolerance, 
 }
 
 int8_t PoseTracking::moveToPose(const Eigen::Vector3d& positional_tolerance, const double angular_tolerance,
-                                const geometry_msgs::PoseStampedConstPtr& target_pose)
+                                const geometry_msgs::PoseStampedPtr& target_pose)
 {
   moveToPoseAsync(positional_tolerance, angular_tolerance, target_pose);
   return blockUntilComplete();
@@ -252,7 +252,8 @@ void PoseTracking::initializePID(const PIDConfig& pid_config, std::vector<contro
 
 bool PoseTracking::satisfiesPoseTolerance(const geometry_msgs::PoseStamped& target_pose,
                                           const Eigen::Isometry3d& current_ee_tf,
-                                          const Eigen::Vector3d& positional_tolerance, const double angular_tolerance)
+                                          const Eigen::Vector3d& positional_tolerance,
+                                          const double angular_tolerance) const
 {
   double x_error = target_pose.pose.position.x - current_ee_tf.translation()(0);
   double y_error = target_pose.pose.position.y - current_ee_tf.translation()(1);
@@ -267,13 +268,13 @@ void PoseTracking::targetPoseCallback(const geometry_msgs::PoseStampedConstPtr& 
   // We only want to set the incoming pose as active if the timer is actually running
   if (timer_is_running_)
   {
-    processIncomingTargetPose(msg);
+    processIncomingTargetPose(*msg);
   }
 }
 
-bool PoseTracking::processIncomingTargetPose(const geometry_msgs::PoseStampedConstPtr& msg)
+bool PoseTracking::processIncomingTargetPose(const geometry_msgs::PoseStamped& msg)
 {
-  target_pose_ptr_ = std::make_unique<geometry_msgs::PoseStamped>(*msg);
+  target_pose_ptr_ = std::make_unique<geometry_msgs::PoseStamped>(msg);
 
   // Transform to MoveIt planning frame
   if (target_pose_ptr_->header.frame_id != planning_frame_)

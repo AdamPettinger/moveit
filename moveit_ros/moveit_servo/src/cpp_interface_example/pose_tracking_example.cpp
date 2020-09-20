@@ -131,10 +131,12 @@ int main(int argc, char** argv)
   target_pose.header.stamp = ros::Time::now();
   target_pose_pub.publish(target_pose);
 
-  // Run the pose tracking in a new thread
+  // Start the tracking without an active pose target
   tracker.moveToPoseAsync(lin_tol, rot_tol);
 
   ros::Rate loop_rate(50);
+
+  // We can update the pose dynamically with ROS messages
   for (size_t i = 0; i < 500; ++i)
   {
     // Modify the pose target a little bit each cycle
@@ -149,6 +151,25 @@ int main(int argc, char** argv)
   // Wait until the motion is complete, and print the result
   int8_t pose_tracking_status = tracker.blockUntilComplete();
   auto result_map = moveit_servo::POSE_TRACKING_STATUS_CODE_MAP;
+  ROS_INFO_STREAM_NAMED(LOGNAME, "Result of the motion was: " << result_map[pose_tracking_status]);
+
+  // We can also start the tracker with an active target
+  geometry_msgs::PoseStampedPtr target_pose_ptr = boost::make_shared<geometry_msgs::PoseStamped>(target_pose);
+  target_pose_ptr->pose.position.x -= 0.1;
+  tracker.moveToPoseAsync(lin_tol, rot_tol, target_pose_ptr);
+
+  // And we can update the pose dynamically WITHOUT ROS messages
+  for (size_t i = 0; i < 500; ++i)
+  {
+    target_pose_ptr->pose.position.z -= 0.0004;
+    target_pose_ptr->header.stamp = ros::Time::now();
+    tracker.moveToPoseAsync(lin_tol, rot_tol, target_pose_ptr);
+
+    loop_rate.sleep();
+  }
+
+  // Wait until the motion is complete, and print the result
+  pose_tracking_status = tracker.blockUntilComplete();
   ROS_INFO_STREAM_NAMED(LOGNAME, "Result of the motion was: " << result_map[pose_tracking_status]);
 
   // Make sure the tracker is stopped and clean up
