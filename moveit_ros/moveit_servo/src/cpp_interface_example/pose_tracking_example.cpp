@@ -45,7 +45,7 @@
 #include <moveit_servo/make_shared_from_pool.h>
 #include <thread>
 
-static const std::string LOGNAME = "cpp_interface_example";
+static const std::string LOGNAME = "pose_tracking_example";
 
 // Class for monitoring status of moveit_servo
 class StatusMonitor
@@ -132,7 +132,7 @@ int main(int argc, char** argv)
   target_pose_pub.publish(target_pose);
 
   // Run the pose tracking in a new thread
-  std::thread move_to_pose_thread([&tracker, &lin_tol, &rot_tol] { tracker.moveToPose(lin_tol, rot_tol); });
+  tracker.moveToPoseAsync(lin_tol, rot_tol);
 
   ros::Rate loop_rate(50);
   for (size_t i = 0; i < 500; ++i)
@@ -146,9 +146,13 @@ int main(int argc, char** argv)
     loop_rate.sleep();
   }
 
+  // Wait until the motion is complete, and print the result
+  int8_t pose_tracking_status = tracker.blockUntilComplete();
+  auto result_map = moveit_servo::POSE_TRACKING_STATUS_CODE_MAP;
+  ROS_INFO_STREAM_NAMED(LOGNAME, "Result of the motion was: " << result_map[pose_tracking_status]);
+
   // Make sure the tracker is stopped and clean up
   tracker.stopMotion();
-  move_to_pose_thread.join();
 
   return EXIT_SUCCESS;
 }

@@ -77,14 +77,16 @@ enum PoseTrackingStatusCode : int8_t
   SUCCESS = 0,
   NO_RECENT_TARGET_POSE = 1,
   NO_RECENT_END_EFFECTOR_POSE = 2,
-  STOP_REQUESTED = 3
+  STOP_REQUESTED = 3,
+  MOVE_IN_PROGRESS = 4
 };
 
 const std::unordered_map<int8_t, std::string>
     POSE_TRACKING_STATUS_CODE_MAP({ { SUCCESS, "Success" },
                                     { NO_RECENT_TARGET_POSE, "No recent target pose" },
                                     { NO_RECENT_END_EFFECTOR_POSE, "No recent end effector pose" },
-                                    { STOP_REQUESTED, "Stop requested" } });
+                                    { STOP_REQUESTED, "Stop requested" },
+                                    { MOVE_IN_PROGRESS, "Move in progress" } });
 
 /**
  * Class PoseTracking - subscribe to a target pose.
@@ -97,12 +99,32 @@ public:
   PoseTracking(const planning_scene_monitor::PlanningSceneMonitorPtr& planning_scene_monitor,
                const std::string& parameter_ns = "");
 
-  int8_t moveToPose(const Eigen::Vector3d& positional_tolerance, const double angular_tolerance);
+  /**
+   * Starts Servoing towards the goal pose, and blocks until the motion is completed
+   *
+   * @param positional_tolerance The translational tolerances for when the motion is complete
+   * @param angular_tolerance if the rotational tolerance for when the motion is complete
+   * @param angular_tolerance if the rotational tolerance for when the motion is complete
+   * @return Pose status tracking code of the move
+   */
+  int8_t moveToPose(const Eigen::Vector3d& positional_tolerance, const double angular_tolerance,
+                    const geometry_msgs::PoseStampedConstPtr& target_pose = nullptr);
+
+  /**
+   * Asynchronously starts Servoing towards the goal pose
+   *
+   * @param positional_tolerance The translational tolerances for when the motion is complete
+   * @param angular_tolerance if the rotational tolerance for when the motion is complete
+   * @param angular_tolerance if the rotational tolerance for when the motion is complete
+   */
+  void moveToPoseAsync(const Eigen::Vector3d& positional_tolerance, const double angular_tolerance,
+                       const geometry_msgs::PoseStampedConstPtr& target_pose = nullptr);
 
   /** \brief A method for a different thread to stop motion and return early from control loop */
   void stopMotion()
   {
-    stop_requested_ = true;
+    status_ = STOP_REQUESTED;
+    stopTimer();
   }
 
   /** \brief Change PID parameters. Motion is stopped before the udpate */
@@ -126,6 +148,22 @@ public:
 
   // moveit_servo::Servo instance. Public so we can access member functions like setPaused()
   std::unique_ptr<moveit_servo::Servo> servo_;
+  /**
+   * Blocks the return until the move to pose task is complete
+   *
+   * @return The status code of the completed motion
+   */
+  int8_t blockUntilComplete();
+
+  /**
+   * Check if a move is in progress
+   *
+   * @return True if there is an active target pose and we are moving to it, false otherwise
+   */
+  bool moveIsActive()
+  {
+    return timer_is_running_;
+  };
 
 private:
   /** \brief Load ROS parameters for controller settings. */
@@ -134,26 +172,42 @@ private:
   /** \brief Initialize a PID controller and add it to vector of controllers */
   void initializePID(const PIDConfig& pid_config, std::vector<control_toolbox::Pid>& pid_vector);
 
-  /** \brief Return true if a target pose has been received within timeout [seconds] */
-  bool haveRecentTargetPose(const double timeout);
-
-  /** \brief Return true if an end effector pose has been received within timeout [seconds] */
-  bool haveRecentEndEffectorPose(const double timeout);
-
-  /** \brief Check if XYZ, roll/pitch/yaw tolerances are satisfied */
-  bool satisfiesPoseTolerance(const Eigen::Vector3d& positional_tolerance, const double angular_tolerance);
+  /**
+   * Check if XYZ, roll/pitch/yaw tolerances are satisfied
+   *
+   * @param target_pose The target pose check for
+   * @param current_ee_tf The current position of the end effector
+   * @param positional_tolerance Tolerances for linear distances
+   * @param angular_tolerance Tolerance for angular distance
+   * @return True if the pose is sufficiently close
+   */
+  bool satisfiesPoseTolerance(const geometry_msgs::PoseStamped& target_pose, const Eigen::Isometry3d& current_ee_tf,
+                              const Eigen::Vector3d& positional_tolerance, const double angular_tolerance);
 
   /** \brief Subscribe to the target pose on this topic */
   void targetPoseCallback(const geometry_msgs::PoseStampedConstPtr& msg);
 
-  /** \brief Update PID controller target positions & orientations */
-  void updateControllerSetpoints();
+  /** \brief Main calculation thread */
+  void timerCallback(const ros::TimerEvent& timer_event);
 
-  /** \brief Update PID controller states (positions & orientations) */
-  void updateControllerStateMeasurements();
+  /** \brief Handles the internal tracking for starting the timer */
+  void startTimer();
 
-  /** \brief Use PID controllers to calculate a full spatial velocity toward a pose */
-  geometry_msgs::TwistStampedConstPtr calculateTwistCommand();
+  /** \brief Handles the internal tracking for stopping the timer */
+  void stopTimer();  // TODO(adamp): change name away from "timer" to more specificity?
+
+  /** \brief Converts the target pose to the correct frame and stores it */
+  bool processIncomingTargetPose(const geometry_msgs::PoseStampedConstPtr& msg);
+
+  /**
+   * Use PID controllers to calculate a full spatial velocity toward a pose
+   *
+   * @param target_pose The target pose to calculate for
+   * @param current_ee_tf The current position of the end effector
+   * @return A TwistStamped message pointer ready for publishing
+   */
+  geometry_msgs::TwistStampedConstPtr calculateTwistCommand(const geometry_msgs::PoseStamped& target_pose,
+                                                            const Eigen::Isometry3d& current_ee_tf);
 
   /** \brief Reset flags and PID controllers after a motion completes */
   void doPostMotionReset();
@@ -162,11 +216,12 @@ private:
 
   planning_scene_monitor::PlanningSceneMonitorPtr planning_scene_monitor_;
   robot_model::RobotModelConstPtr robot_model_;
-  const moveit::core::JointModelGroup* joint_model_group_;
   // Joint group used for controlling the motions
   std::string move_group_name_;
 
-  ros::Rate loop_rate_;
+  ros::Timer timer_;
+  ros::Duration timer_period_;
+  PoseTrackingStatusCode status_;
 
   // ROS interface to Servo
   ros::Publisher twist_stamped_pub_;
@@ -178,8 +233,11 @@ private:
 
   // Transforms w.r.t. planning_frame_
   Eigen::Isometry3d end_effector_transform_;
-  ros::Time end_effector_transform_stamp_;
   geometry_msgs::PoseStamped target_pose_;
+  std::unique_ptr<geometry_msgs::PoseStamped> target_pose_ptr_;
+
+  Eigen::Vector3d positional_tolerance_;
+  double angular_tolerance_;
 
   // Subscribe to target pose
   ros::Subscriber target_pose_sub_;
@@ -191,7 +249,7 @@ private:
   std::string planning_frame_;
 
   // Flag that a different thread has requested a stop.
-  std::atomic<bool> stop_requested_;
+  std::atomic<bool> timer_is_running_;
 
   // Read parameters from this namespace
   std::string parameter_ns_;

@@ -37,9 +37,10 @@
 namespace
 {
 constexpr char LOGNAME[] = "pose_tracking";
-constexpr double DEFAULT_LOOP_RATE = 100;     // Hz
-constexpr double ROS_STARTUP_WAIT = 10;       // sec
-constexpr double DEFAULT_POSE_TIMEOUT = 0.1;  // sec
+constexpr double DEFAULT_LOOP_PERIOD = 0.01;    // sec
+constexpr double ROS_STARTUP_WAIT = 10;         // sec
+constexpr double DEFAULT_POSE_TIMEOUT = 0.1;    // sec
+constexpr size_t ROS_LOG_THROTTLE_PERIOD = 30;  // Seconds to throttle logs inside loops
 }  // namespace
 
 namespace moveit_servo
@@ -47,16 +48,19 @@ namespace moveit_servo
 PoseTracking::PoseTracking(const planning_scene_monitor::PlanningSceneMonitorPtr& planning_scene_monitor,
                            const std::string& parameter_ns)
   : planning_scene_monitor_(planning_scene_monitor)
-  , loop_rate_(DEFAULT_LOOP_RATE)
+  , timer_period_(DEFAULT_LOOP_PERIOD)
+  , status_(NO_RECENT_TARGET_POSE)
+  , angular_tolerance_(0)
   , transform_listener_(transform_buffer_)
-  , stop_requested_(false)
+  , timer_is_running_(false)
   , parameter_ns_(parameter_ns)
   , angular_error_(0)
 {
   readROSParams();
 
+  positional_tolerance_.setZero();
+
   robot_model_ = planning_scene_monitor_->getRobotModel();
-  joint_model_group_ = robot_model_->getJointModelGroup(move_group_name_);
 
   // Initialize PID controllers
   initializePID(x_pid_config_, cartesian_position_pids_);
@@ -78,69 +82,100 @@ PoseTracking::PoseTracking(const planning_scene_monitor::PlanningSceneMonitorPtr
       nh_.advertise<geometry_msgs::TwistStamped>(servo_->getParameters().cartesian_command_in_topic, 1);
 }
 
-int8_t PoseTracking::moveToPose(const Eigen::Vector3d& positional_tolerance, const double angular_tolerance)
+void PoseTracking::timerCallback(const ros::TimerEvent& timer_event)
 {
-  // Roll back the target pose timestamp to ensure we wait for a new target pose message
-  target_pose_.header.stamp = ros::Time::now() - ros::Duration(2 * DEFAULT_POSE_TIMEOUT);
-
-  // Wait a bit for a target pose message to arrive.
-  // The target pose may get updated by new messages as the robot moves (in a callback function).
-  ros::Time start_time = ros::Time::now();
-  while ((!haveRecentTargetPose(DEFAULT_POSE_TIMEOUT) || !haveRecentEndEffectorPose(DEFAULT_POSE_TIMEOUT)) &&
-         ((ros::Time::now() - start_time).toSec() < DEFAULT_POSE_TIMEOUT))
+  // Check for an active target pose
+  if (target_pose_ptr_)
   {
-    if (servo_->getEEFrameTransform(end_effector_transform_))
-    {
-      end_effector_transform_stamp_ = ros::Time::now();
-    }
-    ros::Duration(0.001).sleep();
+    // Copy the target pose to use for this cycle
+    target_pose_ = *target_pose_ptr_;
   }
-  if (!haveRecentTargetPose(DEFAULT_POSE_TIMEOUT))
+  else
   {
-    ROS_ERROR_STREAM_NAMED(LOGNAME, "The target pose was not updated recently. Aborting.");
-    return PoseTrackingStatusCode::NO_RECENT_TARGET_POSE;
+    status_ = NO_RECENT_TARGET_POSE;
+    // TODO(adamp): track how long we are in this state and warn user if too long
+    return;
   }
 
-  while (ros::ok())
+  // Make sure we have a valid pose from the Servo
+  if (!servo_->getEEFrameTransform(end_effector_transform_))
   {
-    // Check for reasons to stop:
-    // - Goal tolerance is satisfied
-    // - Timeout
-    // - Another thread requested a stop
-    // - PID controllers aren't initialized
-    if (satisfiesPoseTolerance(positional_tolerance, angular_tolerance))
-    {
-      break;
-    }
-
-    // Attempt to update robot pose
-    if (servo_->getEEFrameTransform(end_effector_transform_))
-    {
-      end_effector_transform_stamp_ = ros::Time::now();
-    }
-
-    if (!haveRecentEndEffectorPose(DEFAULT_POSE_TIMEOUT))
-    {
-      ROS_ERROR_STREAM_NAMED(LOGNAME, "The end effector pose was not updated in time. Aborting.");
-      doPostMotionReset();
-      return PoseTrackingStatusCode::NO_RECENT_END_EFFECTOR_POSE;
-    }
-    if (stop_requested_)
-    {
-      ROS_INFO_STREAM_NAMED(LOGNAME, "Halting servo motion, a stop was requested.");
-      doPostMotionReset();
-      return PoseTrackingStatusCode::STOP_REQUESTED;
-    }
-
-    // Compute servo command from PID controller output
-    auto msg = calculateTwistCommand();
-
-    // Send command to the Servo object, for execution
-    twist_stamped_pub_.publish(*msg);
+    status_ = NO_RECENT_END_EFFECTOR_POSE;
+    ROS_WARN_THROTTLE_NAMED(ROS_LOG_THROTTLE_PERIOD, LOGNAME, "Could not get end effector pose from Servo!");
+    // TODO(adamp): decide if we stop the timer or just skip this CB cycle
+    return;
   }
 
+  // Check to see if we have reached the target pose
+  if (satisfiesPoseTolerance(target_pose_, end_effector_transform_, positional_tolerance_, angular_tolerance_))
+  {
+    status_ = SUCCESS;
+    stopTimer();
+    return;
+  }
+
+  // If we made it here, we need to do the actual math and move the robot
+  status_ = MOVE_IN_PROGRESS;
+
+  // Compute servo command from PID controller output
+  auto msg = calculateTwistCommand(target_pose_, end_effector_transform_);
+
+  // Send command to the Servo object, for execution
+  twist_stamped_pub_.publish(*msg);
+}
+
+void PoseTracking::moveToPoseAsync(const Eigen::Vector3d& positional_tolerance, const double angular_tolerance,
+                                   const geometry_msgs::PoseStampedConstPtr& target_pose)
+{
+  // Set the passed pose as the target pose if it's not null
+  if (target_pose)
+  {
+    processIncomingTargetPose(target_pose);
+  }
+
+  // Set the tolerances for the move
+  positional_tolerance_ = positional_tolerance;
+  angular_tolerance_ = angular_tolerance;
+
+  // Start the timer if it's not already running
+  if (!timer_is_running_)
+  {
+    startTimer();
+  }
+}
+
+int8_t PoseTracking::moveToPose(const Eigen::Vector3d& positional_tolerance, const double angular_tolerance,
+                                const geometry_msgs::PoseStampedConstPtr& target_pose)
+{
+  moveToPoseAsync(positional_tolerance, angular_tolerance, target_pose);
+  return blockUntilComplete();
+}
+
+int8_t PoseTracking::blockUntilComplete()
+{
+  // Wait until ROS dies or the timer is not running
+  ros::Duration wait_period(0.001);
+  while (ros::ok() && timer_is_running_)
+  {
+    wait_period.sleep();
+  }
+
+  // Then return the current status
+  return status_;
+}
+
+void PoseTracking::startTimer()
+{
+  timer_is_running_ = true;
+  timer_ = nh_.createTimer(timer_period_, &PoseTracking::timerCallback, this);
+}
+
+void PoseTracking::stopTimer()
+{
+  timer_is_running_ = false;
+  timer_.stop();
+  target_pose_ptr_.reset();
   doPostMotionReset();
-  return PoseTrackingStatusCode::SUCCESS;
 }
 
 void PoseTracking::readROSParams()
@@ -177,7 +212,7 @@ void PoseTracking::readROSParams()
 
   double publish_period;
   error += !rosparam_shortcuts::get("", nh_, parameter_ns_ + "/publish_period", publish_period);
-  loop_rate_ = ros::Rate(1 / publish_period);
+  timer_period_ = ros::Duration(publish_period);
 
   x_pid_config_.dt = publish_period;
   y_pid_config_.dt = publish_period;
@@ -215,21 +250,13 @@ void PoseTracking::initializePID(const PIDConfig& pid_config, std::vector<contro
                                             pid_config.windup_limit, use_anti_windup));
 }
 
-bool PoseTracking::haveRecentTargetPose(const double timespan)
+bool PoseTracking::satisfiesPoseTolerance(const geometry_msgs::PoseStamped& target_pose,
+                                          const Eigen::Isometry3d& current_ee_tf,
+                                          const Eigen::Vector3d& positional_tolerance, const double angular_tolerance)
 {
-  return ((ros::Time::now() - target_pose_.header.stamp).toSec() < timespan);
-}
-
-bool PoseTracking::haveRecentEndEffectorPose(const double timespan)
-{
-  return ((ros::Time::now() - end_effector_transform_stamp_).toSec() < timespan);
-}
-
-bool PoseTracking::satisfiesPoseTolerance(const Eigen::Vector3d& positional_tolerance, const double angular_tolerance)
-{
-  double x_error = target_pose_.pose.position.x - end_effector_transform_.translation()(0);
-  double y_error = target_pose_.pose.position.y - end_effector_transform_.translation()(1);
-  double z_error = target_pose_.pose.position.z - end_effector_transform_.translation()(2);
+  double x_error = target_pose.pose.position.x - current_ee_tf.translation()(0);
+  double y_error = target_pose.pose.position.y - current_ee_tf.translation()(1);
+  double z_error = target_pose.pose.position.z - current_ee_tf.translation()(2);
 
   return (fabs(x_error) < positional_tolerance(0)) && (fabs(y_error) < positional_tolerance(1)) &&
          (fabs(z_error) < positional_tolerance(2) && fabs(angular_error_) < angular_tolerance);
@@ -237,49 +264,61 @@ bool PoseTracking::satisfiesPoseTolerance(const Eigen::Vector3d& positional_tole
 
 void PoseTracking::targetPoseCallback(const geometry_msgs::PoseStampedConstPtr& msg)
 {
-  // Transform to MoveIt planning frame
-  target_pose_ = *msg;
-  if (target_pose_.header.frame_id != planning_frame_)
+  // We only want to set the incoming pose as active if the timer is actually running
+  if (timer_is_running_)
   {
-    auto target_to_planning_frame = transform_buffer_.lookupTransform(planning_frame_, target_pose_.header.frame_id,
-                                                                      ros::Time(0), ros::Duration(0.1));
-    tf2::doTransform(target_pose_, target_pose_, target_to_planning_frame);
+    processIncomingTargetPose(msg);
   }
-  target_pose_.header.stamp = ros::Time::now();
 }
 
-geometry_msgs::TwistStampedConstPtr PoseTracking::calculateTwistCommand()
+bool PoseTracking::processIncomingTargetPose(const geometry_msgs::PoseStampedConstPtr& msg)
+{
+  target_pose_ptr_ = std::make_unique<geometry_msgs::PoseStamped>(*msg);
+
+  // Transform to MoveIt planning frame
+  if (target_pose_ptr_->header.frame_id != planning_frame_)
+  {
+    auto target_to_planning_frame = transform_buffer_.lookupTransform(
+        planning_frame_, target_pose_ptr_->header.frame_id, ros::Time(0), ros::Duration(0.1));
+    tf2::doTransform(*target_pose_ptr_, *target_pose_ptr_, target_to_planning_frame);
+  }
+  target_pose_ptr_->header.stamp = ros::Time::now();
+
+  return true;
+}
+
+geometry_msgs::TwistStampedConstPtr PoseTracking::calculateTwistCommand(const geometry_msgs::PoseStamped& target_pose,
+                                                                        const Eigen::Isometry3d& current_ee_tf)
 {
   // use the shared pool to create a message more efficiently
   auto msg = moveit::util::make_shared_from_pool<geometry_msgs::TwistStamped>();
-  msg->header.frame_id = target_pose_.header.frame_id;
+  msg->header.frame_id = target_pose.header.frame_id;
 
   // Get twist components from PID controllers
   geometry_msgs::Twist& twist = msg->twist;
 
   // Position
   twist.linear.x = cartesian_position_pids_[0].computeCommand(
-      target_pose_.pose.position.x - end_effector_transform_.translation()(0), loop_rate_.expectedCycleTime());
+      target_pose.pose.position.x - current_ee_tf.translation()(0), timer_period_);
   twist.linear.y = cartesian_position_pids_[1].computeCommand(
-      target_pose_.pose.position.y - end_effector_transform_.translation()(1), loop_rate_.expectedCycleTime());
+      target_pose.pose.position.y - current_ee_tf.translation()(1), timer_period_);
   twist.linear.z = cartesian_position_pids_[2].computeCommand(
-      target_pose_.pose.position.z - end_effector_transform_.translation()(2), loop_rate_.expectedCycleTime());
+      target_pose.pose.position.z - current_ee_tf.translation()(2), timer_period_);
 
   // Orientation algorithm:
   // - Find the orientation error as a quaternion: q_error = q_desired * q_current ^ -1
   // - Use the quaternion PID controllers to calculate a quaternion rate, q_error_dot
   // - Convert to angular velocity for the TwistStamped message
-  Eigen::Quaterniond q_desired(target_pose_.pose.orientation.w, target_pose_.pose.orientation.x,
-                               target_pose_.pose.orientation.y, target_pose_.pose.orientation.z);
-  Eigen::Quaterniond q_current(end_effector_transform_.rotation());
+  Eigen::Quaterniond q_desired(target_pose.pose.orientation.w, target_pose.pose.orientation.x,
+                               target_pose.pose.orientation.y, target_pose.pose.orientation.z);
+  Eigen::Quaterniond q_current(current_ee_tf.rotation());
   Eigen::Quaterniond q_error = q_desired * q_current.inverse();
 
   // Convert axis-angle to angular velocity
   Eigen::AngleAxisd axis_angle(q_error);
   // Cache the angular error, for rotation tolerance checking
   angular_error_ = axis_angle.angle();
-  double ang_vel_magnitude =
-      cartesian_orientation_pids_[0].computeCommand(angular_error_, loop_rate_.expectedCycleTime());
+  double ang_vel_magnitude = cartesian_orientation_pids_[0].computeCommand(angular_error_, timer_period_);
   twist.angular.x = ang_vel_magnitude * axis_angle.axis()[0];
   twist.angular.y = ang_vel_magnitude * axis_angle.axis()[1];
   twist.angular.z = ang_vel_magnitude * axis_angle.axis()[2];
@@ -291,7 +330,6 @@ geometry_msgs::TwistStampedConstPtr PoseTracking::calculateTwistCommand()
 
 void PoseTracking::doPostMotionReset()
 {
-  stop_requested_ = false;
   angular_error_ = 0;
 
   // Reset error integrals and previous errors of PID controllers
