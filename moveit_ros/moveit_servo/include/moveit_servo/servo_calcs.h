@@ -302,5 +302,8 @@ private:
   ros::Time latest_joint_command_stamp_ = ros::Time(0.);
   bool latest_nonzero_twist_stamped_ = false;
   bool latest_nonzero_joint_cmd_ = false;
+
+  bool using_dls_ = false;
+  Eigen::VectorXd dls_deviation_;
 };
 }  // namespace moveit_servo
